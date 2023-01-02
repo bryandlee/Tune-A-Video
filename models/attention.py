@@ -218,7 +218,8 @@ class SpatioTemporalTransformerBlock(nn.Module):
             dropout=dropout,
             bias=attention_bias,
             upcast_attention=upcast_attention,
-        )  # is self-attn if encoder_hidden_states is none
+        )
+        nn.init.zeros_(self.attn_temporal.to_out[0].weight.data)  # initialize as an identity function
         self.norm_temporal = (
             AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
         )
