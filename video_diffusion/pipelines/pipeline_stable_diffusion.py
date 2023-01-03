@@ -16,13 +16,14 @@ import inspect
 from typing import Callable, List, Optional, Union
 
 import torch
+from einops import rearrange
 
 from diffusers.utils import is_accelerate_available
 from packaging import version
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
 from diffusers.configuration_utils import FrozenDict
-from diffusers.models import AutoencoderKL, UNet2DConditionModel
+from diffusers.models import AutoencoderKL
 from diffusers.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import (
     DDIMScheduler,
@@ -35,6 +36,8 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate, logging
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+
+from ..models.unet_3d_condition import UNetPseudo3DConditionModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -74,7 +77,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         vae: AutoencoderKL,
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
-        unet: UNet2DConditionModel,
+        unet: UNetPseudo3DConditionModel,
         scheduler: Union[
             DDIMScheduler,
             PNDMScheduler,
@@ -83,9 +86,9 @@ class StableDiffusionPipeline(DiffusionPipeline):
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
         ],
-        safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPFeatureExtractor,
-        requires_safety_checker: bool = True,
+        safety_checker=None,
+        requires_safety_checker: bool = False,
     ):
         super().__init__()
 
@@ -353,11 +356,15 @@ class StableDiffusionPipeline(DiffusionPipeline):
         return image, has_nsfw_concept
 
     def decode_latents(self, latents):
+        b = latents.shape[0]
         latents = 1 / 0.18215 * latents
+        latents = rearrange(latents, "b c f h w -> (b f) c h w")
         image = self.vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+
+        image = image.cpu().float().numpy()
+        image = rearrange(image, "(b f) c h w -> b f h w c", b=b)
         return image
 
     def prepare_extra_step_kwargs(self, generator, eta):
@@ -395,11 +402,21 @@ class StableDiffusionPipeline(DiffusionPipeline):
             )
 
     def prepare_latents(
-        self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None
+        self,
+        batch_size,
+        num_channels_latents,
+        frame_length,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
     ):
         shape = (
             batch_size,
             num_channels_latents,
+            frame_length,
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )
@@ -439,6 +456,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
+        frames_length: int = 8,
         guidance_scale: float = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
@@ -533,6 +551,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
+            frames_length,
             height,
             width,
             text_embeddings.dtype,
@@ -579,7 +598,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         image = self.decode_latents(latents)
 
         # 9. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
+        has_nsfw_concept = None
 
         # 10. Convert to PIL
         if output_type == "pil":
@@ -589,3 +608,10 @@ class StableDiffusionPipeline(DiffusionPipeline):
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+    @staticmethod
+    def numpy_to_pil(images):
+        pil_images = []
+        for sequence in images:
+            pil_images.append(DiffusionPipeline.numpy_to_pil(sequence))
+        return pil_images

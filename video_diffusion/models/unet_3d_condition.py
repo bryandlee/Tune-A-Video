@@ -22,71 +22,27 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput, logging
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
-from .unet_2d_blocks import (
-    CrossAttnDownBlock2D,
-    CrossAttnUpBlock2D,
-    DownBlock2D,
-    UNetMidBlock2DCrossAttn,
-    UNetMidBlock2DSimpleCrossAttn,
-    UpBlock2D,
+from .unet_3d_blocks import (
+    CrossAttnDownBlockPseudo3D,
+    CrossAttnUpBlockPseudo3D,
+    DownBlockPseudo3D,
+    UNetMidBlockPseudo3DCrossAttn,
+    UpBlockPseudo3D,
     get_down_block,
     get_up_block,
 )
+from .resnet import PseudoConv3d
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 @dataclass
-class UNet2DConditionOutput(BaseOutput):
-    """
-    Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
-            Hidden states conditioned on `encoder_hidden_states` input. Output of last layer of model.
-    """
-
+class UNetPseudo3DConditionOutput(BaseOutput):
     sample: torch.FloatTensor
 
 
-class UNet2DConditionModel(ModelMixin, ConfigMixin):
-    r"""
-    UNet2DConditionModel is a conditional 2D UNet model that takes in a noisy sample, conditional state, and a timestep
-    and returns sample shaped output.
-
-    This model inherits from [`ModelMixin`]. Check the superclass documentation for the generic methods the library
-    implements for all the models (such as downloading or saving, etc.)
-
-    Parameters:
-        sample_size (`int` or `Tuple[int, int]`, *optional*, defaults to `None`):
-            Height and width of input/output sample.
-        in_channels (`int`, *optional*, defaults to 4): The number of channels in the input sample.
-        out_channels (`int`, *optional*, defaults to 4): The number of channels in the output.
-        center_input_sample (`bool`, *optional*, defaults to `False`): Whether to center the input sample.
-        flip_sin_to_cos (`bool`, *optional*, defaults to `False`):
-            Whether to flip the sin to cos in the time embedding.
-        freq_shift (`int`, *optional*, defaults to 0): The frequency shift to apply to the time embedding.
-        down_block_types (`Tuple[str]`, *optional*, defaults to `("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")`):
-            The tuple of downsample blocks to use.
-        mid_block_type (`str`, *optional*, defaults to `"UNetMidBlock2DCrossAttn"`):
-            The mid block type. Choose from `UNetMidBlock2DCrossAttn` or `UNetMidBlock2DSimpleCrossAttn`.
-        up_block_types (`Tuple[str]`, *optional*, defaults to `("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D",)`):
-            The tuple of upsample blocks to use.
-        block_out_channels (`Tuple[int]`, *optional*, defaults to `(320, 640, 1280, 1280)`):
-            The tuple of output channels for each block.
-        layers_per_block (`int`, *optional*, defaults to 2): The number of layers per block.
-        downsample_padding (`int`, *optional*, defaults to 1): The padding to use for the downsampling convolution.
-        mid_block_scale_factor (`float`, *optional*, defaults to 1.0): The scale factor to use for the mid block.
-        act_fn (`str`, *optional*, defaults to `"silu"`): The activation function to use.
-        norm_num_groups (`int`, *optional*, defaults to 32): The number of groups to use for the normalization.
-        norm_eps (`float`, *optional*, defaults to 1e-5): The epsilon to use for the normalization.
-        cross_attention_dim (`int`, *optional*, defaults to 1280): The dimension of the cross attention features.
-        attention_head_dim (`int`, *optional*, defaults to 8): The dimension of the attention heads.
-        resnet_time_scale_shift (`str`, *optional*, defaults to `"default"`): Time scale shift config
-            for resnet blocks, see [`~models.resnet.ResnetBlock2D`]. Choose from `default` or `scale_shift`.
-        class_embed_type (`str`, *optional*, defaults to None): The type of class embedding to use which is ultimately
-            summed with the time embeddings. Choose from `None`, `"timestep"`, or `"identity"`.
-    """
-
+class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -99,17 +55,17 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         flip_sin_to_cos: bool = True,
         freq_shift: int = 0,
         down_block_types: Tuple[str] = (
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "DownBlock2D",
+            "CrossAttnDownBlockPseudo3D",
+            "CrossAttnDownBlockPseudo3D",
+            "CrossAttnDownBlockPseudo3D",
+            "DownBlockPseudo3D",
         ),
-        mid_block_type: str = "UNetMidBlock2DCrossAttn",
+        mid_block_type: str = "UNetMidBlockPseudo3DCrossAttn",
         up_block_types: Tuple[str] = (
-            "UpBlock2D",
-            "CrossAttnUpBlock2D",
-            "CrossAttnUpBlock2D",
-            "CrossAttnUpBlock2D",
+            "UpBlockPseudo3D",
+            "CrossAttnUpBlockPseudo3D",
+            "CrossAttnUpBlockPseudo3D",
+            "CrossAttnUpBlockPseudo3D",
         ),
         only_cross_attention: Union[bool, Tuple[bool]] = False,
         block_out_channels: Tuple[int] = (320, 640, 1280, 1280),
@@ -134,7 +90,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         time_embed_dim = block_out_channels[0] * 4
 
         # input
-        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
+        self.conv_in = PseudoConv3d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
 
         # time
         self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
@@ -191,8 +147,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
             self.down_blocks.append(down_block)
 
         # mid
-        if mid_block_type == "UNetMidBlock2DCrossAttn":
-            self.mid_block = UNetMidBlock2DCrossAttn(
+        if mid_block_type == "UNetMidBlockPseudo3DCrossAttn":
+            self.mid_block = UNetMidBlockPseudo3DCrossAttn(
                 in_channels=block_out_channels[-1],
                 temb_channels=time_embed_dim,
                 resnet_eps=norm_eps,
@@ -205,18 +161,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                 dual_cross_attention=dual_cross_attention,
                 use_linear_projection=use_linear_projection,
                 upcast_attention=upcast_attention,
-            )
-        elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
-            self.mid_block = UNetMidBlock2DSimpleCrossAttn(
-                in_channels=block_out_channels[-1],
-                temb_channels=time_embed_dim,
-                resnet_eps=norm_eps,
-                resnet_act_fn=act_fn,
-                output_scale_factor=mid_block_scale_factor,
-                cross_attention_dim=cross_attention_dim,
-                attn_num_head_channels=attention_head_dim[-1],
-                resnet_groups=norm_num_groups,
-                resnet_time_scale_shift=resnet_time_scale_shift,
             )
         else:
             raise ValueError(f"unknown mid_block_type : {mid_block_type}")
@@ -270,7 +214,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
             num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
         )
         self.conv_act = nn.SiLU()
-        self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
+        self.conv_out = PseudoConv3d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
     def set_attention_slice(self, slice_size):
         r"""
@@ -340,7 +284,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
             fn_recursive_set_attention_slice(module, reversed_slice_size)
 
     def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (CrossAttnDownBlock2D, DownBlock2D, CrossAttnUpBlock2D, UpBlock2D)):
+        if isinstance(
+            module,
+            (CrossAttnDownBlockPseudo3D, DownBlockPseudo3D, CrossAttnUpBlockPseudo3D, UpBlockPseudo3D),
+        ):
             module.gradient_checkpointing = value
 
     def forward(
@@ -351,20 +298,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         class_labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-    ) -> Union[UNet2DConditionOutput, Tuple]:
-        r"""
-        Args:
-            sample (`torch.FloatTensor`): (batch, channel, height, width) noisy inputs tensor
-            timestep (`torch.FloatTensor` or `float` or `int`): (batch) timesteps
-            encoder_hidden_states (`torch.FloatTensor`): (batch, sequence_length, feature_dim) encoder hidden states
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.unet_2d_condition.UNet2DConditionOutput`] or `tuple`:
-            [`~models.unet_2d_condition.UNet2DConditionOutput`] if `return_dict` is True, otherwise a `tuple`. When
-            returning a tuple, the first element is the sample tensor.
-        """
+    ) -> Union[UNetPseudo3DConditionOutput, Tuple]:
         # By default samples have to be AT least a multiple of the overall upsampling factor.
         # The overall upsampling factor is equal to 2 ** (# num of upsampling layears).
         # However, the upsampling interpolation output size can be forced to fit any upsampling size
@@ -482,4 +416,4 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         if not return_dict:
             return (sample,)
 
-        return UNet2DConditionOutput(sample=sample)
+        return UNetPseudo3DConditionOutput(sample=sample)
