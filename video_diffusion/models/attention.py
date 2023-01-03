@@ -114,7 +114,9 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
         if is_video:
             frame_length = hidden_states.shape[2]
             hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
-        b, _, h, w = hidden_states.shape
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(frame_length, 0)
+
+        *_, h, w = hidden_states.shape
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
@@ -144,7 +146,7 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
 
         output = hidden_states + residual
         if is_video:
-            output = rearrange(output, "(b f) c h w -> b c f h w", b=b)
+            output = rearrange(output, "(b f) c h w -> b c f h w", f=frame_length)
 
         if not return_dict:
             return (output,)
@@ -253,9 +255,9 @@ class SpatioTemporalTransformerBlock(nn.Module):
                 raise e
             self.attn1._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
             self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
-            self.attn_temporal._use_memory_efficient_attention_xformers = (
-                use_memory_efficient_attention_xformers
-            )
+            # self.attn_temporal._use_memory_efficient_attention_xformers = (
+            #     use_memory_efficient_attention_xformers
+            # ),  # FIXME: enabling this raises CUDA ERROR. Gotta dig in.
 
     def forward(
         self,
@@ -309,6 +311,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
         return hidden_states
 
     def apply_temporal_attention(self, hidden_states, timestep, frame_length):
+        d = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=frame_length)
         norm_hidden_states = (
             self.norm_temporal(hidden_states, timestep)
@@ -316,5 +319,5 @@ class SpatioTemporalTransformerBlock(nn.Module):
             else self.norm_temporal(hidden_states)
         )
         hidden_states = self.attn_temporal(norm_hidden_states) + hidden_states
-        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", f=frame_length)
+        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
         return hidden_states
