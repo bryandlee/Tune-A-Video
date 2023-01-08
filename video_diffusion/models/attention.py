@@ -28,13 +28,7 @@ from einops import rearrange
 
 @dataclass
 class SpatioTemporalTransformerModelOutput(BaseOutput):
-    """
-    Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)` or `(batch size, num_vector_embeds - 1, num_latent_pixels)` if [`Transformer2DModel`] is discrete):
-            Hidden states conditioned on `encoder_hidden_states` input. If discrete, returns probability distributions
-            for the unnoised latent pixels.
-    """
-
+    """ torch.FloatTensor of shape [batch x channel x frames x height x width] """
     sample: torch.FloatTensor
 
 
@@ -62,6 +56,7 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
         use_linear_projection: bool = False,
         only_cross_attention: bool = False,
         upcast_attention: bool = False,
+        **transformer_kwargs,
     ):
         super().__init__()
         self.use_linear_projection = use_linear_projection
@@ -94,6 +89,7 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
                     attention_bias=attention_bias,
                     only_cross_attention=only_cross_attention,
                     upcast_attention=upcast_attention,
+                    **transformer_kwargs,
                 )
                 for d in range(num_layers)
             ]
@@ -109,12 +105,12 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
         self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True
     ):
         # 1. Input
-        frame_length = None
+        clip_length = None
         is_video = hidden_states.ndim == 5
         if is_video:
-            frame_length = hidden_states.shape[2]
+            clip_length = hidden_states.shape[2]
             hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
-            encoder_hidden_states = encoder_hidden_states.repeat_interleave(frame_length, 0)
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(clip_length, 0)
 
         *_, h, w = hidden_states.shape
         residual = hidden_states
@@ -133,7 +129,7 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep,
-                frame_length=frame_length,
+                clip_length=clip_length,
             )
 
         # 3. Output
@@ -146,7 +142,7 @@ class SpatioTemporalTransformerModel(ModelMixin, ConfigMixin):
 
         output = hidden_states + residual
         if is_video:
-            output = rearrange(output, "(b f) c h w -> b c f h w", f=frame_length)
+            output = rearrange(output, "(b f) c h w -> b c f h w", f=clip_length)
 
         if not return_dict:
             return (output,)
@@ -167,11 +163,13 @@ class SpatioTemporalTransformerBlock(nn.Module):
         attention_bias: bool = False,
         only_cross_attention: bool = False,
         upcast_attention: bool = False,
+        use_sparse_causal_attention: bool = True,
         temporal_attention_position: str = "after_spatial",
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
         self.use_ada_layer_norm = num_embeds_ada_norm is not None
+        self.use_sparse_causal_attention = use_sparse_causal_attention
 
         self.temporal_attention_position = temporal_attention_position
         temporal_attention_positions = ["after_spatial", "after_cross", "after_feedforward"]
@@ -181,7 +179,8 @@ class SpatioTemporalTransformerBlock(nn.Module):
             )
 
         # 1. Spatial-Attn
-        self.attn1 = CrossAttention(
+        spatial_attention = SparseCausalAttention if use_sparse_causal_attention else CrossAttention
+        self.attn1 = spatial_attention(
             query_dim=dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
@@ -265,23 +264,25 @@ class SpatioTemporalTransformerBlock(nn.Module):
         encoder_hidden_states=None,
         timestep=None,
         attention_mask=None,
-        frame_length=None,
+        clip_length=None,
     ):
         # 1. Self-Attention
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         )
 
+        kwargs = dict(
+            hidden_states=norm_hidden_states,
+            attention_mask=attention_mask,
+        )
         if self.only_cross_attention:
-            hidden_states = (
-                self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask)
-                + hidden_states
-            )
-        else:
-            hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask) + hidden_states
+            kwargs.update(encoder_hidden_states=encoder_hidden_states)
+        if self.use_sparse_causal_attention:
+            kwargs.update(clip_length=clip_length)
+        hidden_states = hidden_states + self.attn1(**kwargs)
 
-        if frame_length is not None and self.temporal_attention_position == "after_spatial":
-            hidden_states = self.apply_temporal_attention(hidden_states, timestep, frame_length)
+        if clip_length is not None and self.temporal_attention_position == "after_spatial":
+            hidden_states = self.apply_temporal_attention(hidden_states, timestep, clip_length)
 
         if self.attn2 is not None:
             # 2. Cross-Attention
@@ -299,20 +300,20 @@ class SpatioTemporalTransformerBlock(nn.Module):
                 + hidden_states
             )
 
-        if frame_length is not None and self.temporal_attention_position == "after_cross":
-            hidden_states = self.apply_temporal_attention(hidden_states, timestep, frame_length)
+        if clip_length is not None and self.temporal_attention_position == "after_cross":
+            hidden_states = self.apply_temporal_attention(hidden_states, timestep, clip_length)
 
         # 3. Feed-forward
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
-        if frame_length is not None and self.temporal_attention_position == "after_feedforward":
-            hidden_states = self.apply_temporal_attention(hidden_states, timestep, frame_length)
+        if clip_length is not None and self.temporal_attention_position == "after_feedforward":
+            hidden_states = self.apply_temporal_attention(hidden_states, timestep, clip_length)
 
         return hidden_states
 
-    def apply_temporal_attention(self, hidden_states, timestep, frame_length):
+    def apply_temporal_attention(self, hidden_states, timestep, clip_length):
         d = hidden_states.shape[1]
-        hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=frame_length)
+        hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=clip_length)
         norm_hidden_states = (
             self.norm_temporal(hidden_states, timestep)
             if self.use_ada_layer_norm
@@ -320,4 +321,64 @@ class SpatioTemporalTransformerBlock(nn.Module):
         )
         hidden_states = self.attn_temporal(norm_hidden_states) + hidden_states
         hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+        return hidden_states
+
+
+class SparseCausalAttention(CrossAttention):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        clip_length: int = None,
+    ):
+        if (
+            self.added_kv_proj_dim is not None
+            or encoder_hidden_states is not None
+            or attention_mask is not None
+        ):
+            raise NotImplementedError
+
+        if self.group_norm is not None:
+            hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = self.to_q(hidden_states)
+        dim = query.shape[-1]
+        query = self.reshape_heads_to_batch_dim(query)
+
+        key = self.to_k(hidden_states)
+        value = self.to_v(hidden_states)
+
+        prev_frame_index = torch.arange(clip_length) - 1
+        prev_frame_index[0] = 0
+
+        key = rearrange(key, "(b f) d c -> b f d c", f=clip_length)
+        key = torch.cat([key[:, [0] * clip_length], key[:, prev_frame_index]], dim=2)
+        key = rearrange(key, "b f d c -> (b f) d c", f=clip_length)
+
+        value = rearrange(value, "(b f) d c -> b f d c", f=clip_length)
+        value = torch.cat([value[:, [0] * clip_length], value[:, prev_frame_index]], dim=2)
+        value = rearrange(value, "b f d c -> (b f) d c", f=clip_length)
+
+        key = self.reshape_heads_to_batch_dim(key)
+        value = self.reshape_heads_to_batch_dim(value)
+
+        # attention, what we cannot get enough of
+        if self._use_memory_efficient_attention_xformers:
+            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
+            # Some versions of xformers return output in fp32, cast it back to the dtype of the input
+            hidden_states = hidden_states.to(query.dtype)
+        else:
+            if self._slice_size is None or query.shape[0] // self._slice_size == 1:
+                hidden_states = self._attention(query, key, value, attention_mask)
+            else:
+                hidden_states = self._sliced_attention(
+                    query, key, value, hidden_states.shape[1], dim, attention_mask
+                )
+
+        # linear proj
+        hidden_states = self.to_out[0](hidden_states)
+
+        # dropout
+        hidden_states = self.to_out[1](hidden_states)
         return hidden_states
