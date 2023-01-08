@@ -1,16 +1,7 @@
-# Copyright 2022 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# code mostly taken from https://github.com/huggingface/diffusers
+import os
+import glob
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -417,3 +408,56 @@ class UNetPseudo3DConditionModel(ModelMixin, ConfigMixin):
             return (sample,)
 
         return UNetPseudo3DConditionOutput(sample=sample)
+
+    @classmethod
+    def from_2d_model(cls, model_path):
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.isfile(config_path):
+            raise RuntimeError(f"{config_path} does not exist")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        config.pop("_class_name")
+        config.pop("_diffusers_version")
+
+        block_replacer = {
+            "CrossAttnDownBlock2D": "CrossAttnDownBlockPseudo3D",
+            "DownBlock2D": "DownBlockPseudo3D",
+            "UpBlock2D": "UpBlockPseudo3D",
+            "CrossAttnUpBlock2D": "CrossAttnUpBlockPseudo3D",
+        }
+
+        def convert_2d_to_3d_block(block):
+            return block_replacer[block] if block in block_replacer else block
+
+        config["down_block_types"] = [
+            convert_2d_to_3d_block(block) for block in config["down_block_types"]
+        ]
+        config["up_block_types"] = [convert_2d_to_3d_block(block) for block in config["up_block_types"]]
+
+        model = cls(**config)
+
+        state_dict_path_condidates = glob.glob(os.path.join(model_path, "*.bin"))
+        if state_dict_path_condidates:
+            state_dict = torch.load(state_dict_path_condidates[0], map_location="cpu")
+            model.load_2d_state_dict(state_dict=state_dict)
+
+        return model
+
+    def load_2d_state_dict(self, state_dict, **kwargs):
+        state_dict_3d = self.state_dict()
+
+        for k, v in state_dict.items():
+            if k not in state_dict_3d:
+                raise KeyError(f"2d state_dict key {k} does not exist in 3d model")
+            elif v.shape != state_dict_3d[k].shape:
+                raise ValueError(f"state_dict shape mismatch, 2d {v.shape}, 3d {state_dict_3d[k].shape}")
+
+        for k, v in state_dict_3d.items():
+            if "_temporal" in k:
+                continue
+            if k not in state_dict:
+                raise KeyError(f"3d state_dict key {k} does not exist in 2d model")
+
+        state_dict_3d.update(state_dict)
+        self.load_state_dict(state_dict_3d, **kwargs)
