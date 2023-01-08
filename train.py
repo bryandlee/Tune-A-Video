@@ -1,10 +1,11 @@
 import itertools
 import os
-import inspect
+import random
 from typing import Optional, List
 import json
 
 import torch
+import torch.utils.data
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
@@ -16,6 +17,7 @@ from diffusers import (
     DDPMScheduler,
     DiffusionPipeline,
     EulerDiscreteScheduler,
+    UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
@@ -32,8 +34,6 @@ from video_diffusion.pipelines.pipeline_stable_diffusion import StableDiffusionP
 from lora_diffusion import (
     inject_trainable_lora,
     save_lora_weight,
-    monkeypatch_lora,
-    tune_lora_scale,
 )
 
 
@@ -44,8 +44,8 @@ gif_duration = 200
 
 def collate_fn(examples):
     batch = {
-        "prompt_ids":  torch.cat([example["prompt_ids"] for example in examples], dim=0),
-        "images": torch.stack([example["images"] for example in examples])
+        "prompt_ids": torch.cat([example["prompt_ids"] for example in examples], dim=0),
+        "images": torch.stack([example["images"] for example in examples]),
     }
     return batch
 
@@ -63,11 +63,13 @@ def save_sample_images(
     image_save_path = os.path.join(image_save_root, f"step_{str(step).zfill(6)}.gif")
 
     sequences = []
-    for idx, prompt in enumerate(tqdm(
-        prompts,
-        desc="Generating sample images",
-        disable=not accelerator.is_local_main_process,
-    )):
+    for idx, prompt in enumerate(
+        tqdm(
+            prompts,
+            desc="Generating sample images",
+            disable=not accelerator.is_local_main_process,
+        )
+    ):
         generator = torch.Generator(device=accelerator.device)
         generator.manual_seed(idx)
         sequence = pipeline(
@@ -82,11 +84,19 @@ def save_sample_images(
         sequences.append(sequence)
 
     sequences = [make_grid(images, cols=2) for images in zip(*sequences)]
-    sequences[0].save(image_save_path, save_all=True, append_images=sequences[1:], optimize=False, loop=0, duration=gif_duration)
+    sequences[0].save(
+        image_save_path,
+        save_all=True,
+        append_images=sequences[1:],
+        optimize=False,
+        loop=0,
+        duration=gif_duration,
+    )
 
 
 def train(
     pretrained_model_name_or_path: str,
+    pretrained_2d_model_name_or_path: str,
     logdir: str,
     train_data_path: str,
     prompt: str,
@@ -129,16 +139,11 @@ def train(
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
     # TODO (patil-suraj): Remove this check when gradient accumulation with two models is enabled in accelerate.
-    if (
-        train_text_encoder
-        and gradient_accumulation_steps > 1
-        and accelerator.num_processes > 1
-    ):
+    if train_text_encoder and gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
         raise ValueError(
             "Gradient accumulation is not supported when training the text encoder in distributed training. "
             "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
         )
-
 
     if seed is not None:
         set_seed(seed)
@@ -184,9 +189,15 @@ def train(
     )
     pipeline.set_progress_bar_config(disable=True)
 
+    unet2d = UNet2DConditionModel.from_pretrained(
+        pretrained_2d_model_name_or_path,
+        subfolder="unet",
+    )
+
     if is_xformers_available():
         try:
             unet.enable_xformers_memory_efficient_attention()
+            unet2d.enable_xformers_memory_efficient_attention()
             pipeline.enable_xformers_memory_efficient_attention()
         except Exception as e:
             logger.warning(
@@ -196,6 +207,7 @@ def train(
 
     vae.requires_grad_(False)
     unet.requires_grad_(False)
+    unet2d.requires_grad_(False)
     text_encoder.requires_grad_(False)
     if lora:
         unet_lora_params, _ = inject_trainable_lora(unet, r=lora_rank)
@@ -210,10 +222,10 @@ def train(
             text_encoder.requires_grad_(True)
 
         for name, module in unet.named_modules():
-            if "temporal" in name:
+            # if name.endswith(("attn_temporal", ".to_q", "conv_temporal")):
+            if name.endswith(("attn_temporal", ".to_q")):
                 for params in module.parameters():
                     params.requires_grad = True
-
 
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -222,10 +234,7 @@ def train(
 
     if scale_lr:
         learning_rate = (
-            learning_rate
-            * gradient_accumulation_steps
-            * train_batch_size
-            * accelerator.num_processes
+            learning_rate * gradient_accumulation_steps * train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -274,6 +283,19 @@ def train(
         subfolder="scheduler",
     )
 
+    # train_datasets = [
+    #     ImageSequenceDataset(
+    #         path=os.path.join(train_data_path, clip_name),
+    #         n_sample_frame=clip_length,
+    #         sampling_rate=10,
+    #         stride=1,
+    #         tokenizer=tokenizer,
+    #         prompt=prompt,
+    #     )
+    #     for clip_name in os.listdir(train_data_path)
+    # ]
+    # train_dataset = torch.utils.data.ConcatDataset(train_datasets)
+
     train_dataset = ImageSequenceDataset(
         path=train_data_path,
         n_sample_frame=clip_length,
@@ -288,7 +310,7 @@ def train(
         batch_size=train_batch_size,
         shuffle=True,
         num_workers=4,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
     )
 
     train_sample_save_path = os.path.join(logdir, "train_samples.gif")
@@ -298,11 +320,18 @@ def train(
             break
         train_samples.append(batch["images"])
     train_samples = torch.cat(train_samples)
-    train_samples = (train_samples.numpy( ) * 0.5 + 0.5).clip(0, 1)
+    train_samples = (train_samples.numpy() * 0.5 + 0.5).clip(0, 1)
     train_samples = rearrange(train_samples, "b c f h w -> b f h w c")
     train_samples = StableDiffusionPipeline.numpy_to_pil(train_samples)
     train_samples = [make_grid(images, cols=2) for images in zip(*train_samples)]
-    train_samples[0].save(train_sample_save_path, save_all=True, append_images=train_samples[1:], optimize=False, loop=0, duration=gif_duration)
+    train_samples[0].save(
+        train_sample_save_path,
+        save_all=True,
+        append_images=train_samples[1:],
+        optimize=False,
+        loop=0,
+        duration=gif_duration,
+    )
 
     lr_scheduler = get_scheduler(
         lr_scheduler,
@@ -337,6 +366,7 @@ def train(
     vae.to(accelerator.device, dtype=weight_dtype)
     if not train_text_encoder:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
+    unet2d.to(accelerator.device, dtype=weight_dtype)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -384,9 +414,9 @@ def train(
             # Convert images to latent space
             images = batch["images"].to(dtype=weight_dtype)
             b = images.shape[0]
-            images  = rearrange(images, "b c f h w -> (b f) c h w")
+            images = rearrange(images, "b c f h w -> (b f) c h w")
             latents = vae.encode(images).latent_dist.sample()
-            latents  = rearrange(latents, "(b f) c h w -> b c f h w", b=b)
+            latents = rearrange(latents, "(b f) c h w -> b c f h w", b=b)
             latents = latents * 0.18215
 
             # Sample noise that we'll add to the latents
@@ -418,8 +448,12 @@ def train(
                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            
+
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+            # regularize_index = random.randint(0, noisy_latents.shape[2] - 1)
+            # model_pred_2d = unet2d(noisy_latents[:,:, regularize_index], timesteps, encoder_hidden_states).sample
+            # loss = loss + F.mse_loss(model_pred[:,:,regularize_index].float(), model_pred_2d.float(), reduction="mean")
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -453,46 +487,6 @@ def train(
                             logdir=logdir,
                         )
 
-                if global_step % checkpointing_steps == 0:
-
-                    if global_step == 10000:
-                        checkpointing_steps = checkpointing_steps * 10
-
-                    if accelerator.is_main_process:
-                        # newer versions of accelerate allow the 'keep_fp32_wrapper' arg. without passing
-                        # it, the models will be unwrapped, and when they are then used for further training,
-                        # we will crash. pass this, but only to newer versions of accelerate. fixes
-                        # https://github.com/huggingface/diffusers/issues/1566
-                        accepts_keep_fp32_wrapper = "keep_fp32_wrapper" in set(
-                            inspect.signature(accelerator.unwrap_model).parameters.keys()
-                        )
-                        extra_args = {"keep_fp32_wrapper": True} if accepts_keep_fp32_wrapper else {}
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            pretrained_model_name_or_path,
-                            unet=accelerator.unwrap_model(unet, **extra_args),
-                            text_encoder=accelerator.unwrap_model(text_encoder, **extra_args),
-                        )
-
-                        if lora:
-                            filename_unet = f"{logdir}/lora_weight_e{epoch}_s{global_step}.pt"
-                            filename_text_encoder = (
-                                f"{logdir}/lora_weight_e{epoch}_s{global_step}.text_encoder.pt"
-                            )
-                            print(f"save weights {filename_unet}, {filename_text_encoder}")
-                            save_lora_weight(pipeline.unet, filename_unet)
-                            if train_text_encoder:
-                                save_lora_weight(
-                                    pipeline.text_encoder,
-                                    filename_text_encoder,
-                                    target_replace_module=["CLIPAttention"],
-                                )
-                        else:
-                            save_path = os.path.join(logdir, f"checkpoint-{global_step}")
-                            pipeline.save_pretrained(save_path)
-                            print(f"Saved state to {save_path}")
-                            filename_unet = None
-                            filename_text_encoder = None
-
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -503,7 +497,6 @@ def train(
         accelerator.wait_for_everyone()
 
         epoch += 1
-
 
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
@@ -528,20 +521,44 @@ def train(
 
 
 if __name__ == "__main__":
+    # args = dict(
+    #     pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5-3d",
+    #     pretrained_2d_model_name_or_path="/data/ckpt/stable-diffusion-v1-5",
+    #     logdir="/data/tune-a-video/ckpt/debug",
+    #     train_data_path="/data/data/video/sample/frames/02",
+    #     prompt="a model is posing",
+    #     validation_steps=100,
+    #     checkpointing_steps=50000,
+    #     clip_length=8,
+    #     sample_prompts=[
+    #         "a female model with long blonde hair is posing",
+    #         "a male model with short black hair is posing",
+    #         "a cat is posing",
+    #         "a cat",
+    #     ],
+    #     seed=0,
+    #     learning_rate=3e-5,
+    # )
+
     args = dict(
         pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5-3d",
+        pretrained_2d_model_name_or_path="/data/ckpt/stable-diffusion-v1-5",
         logdir="/data/tune-a-video/ckpt/debug",
-        train_data_path="/data/data/video/sample/00/frames",
-        prompt="a video of a model photoshoot",
-        validation_steps=500,
+        train_data_path="/data/data/video/sample/surfing/01",
+        prompt="a man is surfing a wave",
+        validation_steps=100,
         checkpointing_steps=50000,
         clip_length=8,
         sample_prompts=[
-            "a video of a model photoshoot",
-            "a model photoshoot",
-            "a photoshoot",
-            "a model",
+            "a man is surfing a wave",
+            "a girl is surfing a wave",
+            "a sloth is surfing a wave",
+            "a sloth",
+            # "a cat is posing",
+            # "a cat",
         ],
         seed=0,
+        learning_rate=3e-5,
+        train_steps=1000,
     )
     train(**args)
