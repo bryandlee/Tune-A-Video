@@ -366,7 +366,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         self,
         batch_size,
         num_channels_latents,
-        frame_length,
+        clip_length,
         height,
         width,
         dtype,
@@ -377,7 +377,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         shape = (
             batch_size,
             num_channels_latents,
-            frame_length,
+            clip_length,
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )
