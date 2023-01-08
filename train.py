@@ -1,7 +1,5 @@
-import itertools
 import os
-import random
-from typing import Optional, List
+from typing import Optional, List, Optional
 import json
 
 import torch
@@ -15,7 +13,6 @@ from accelerate.utils import set_seed
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    DiffusionPipeline,
     EulerDiscreteScheduler,
     UNet2DConditionModel,
 )
@@ -29,12 +26,7 @@ from video_diffusion.models.unet_3d_condition import UNetPseudo3DConditionModel
 from video_diffusion.data.dataset import ImageSequenceDataset
 from video_diffusion.common.util import get_time_string, get_function_args
 from video_diffusion.common.image_util import make_grid, annotate_text
-from video_diffusion.pipelines.pipeline_stable_diffusion import StableDiffusionPipeline
-
-from lora_diffusion import (
-    inject_trainable_lora,
-    save_lora_weight,
-)
+from video_diffusion.pipelines.stable_diffusion import SpatioTemporalStableDiffusionPipeline
 
 
 logger = get_logger(__name__)
@@ -76,7 +68,7 @@ def save_sample_images(
             prompt,
             num_inference_steps=20,
             generator=generator,
-            frames_length=clip_length,
+            clip_length=clip_length,
             guidance_scale=7,
         ).images[0]
 
@@ -96,7 +88,6 @@ def save_sample_images(
 
 def train(
     pretrained_model_name_or_path: str,
-    pretrained_2d_model_name_or_path: str,
     logdir: str,
     train_data_path: str,
     prompt: str,
@@ -104,15 +95,11 @@ def train(
     clip_length=8,
     sample_prompts: List[str] = None,
     train_steps: int = int(1e5),
-    train_text_encoder: bool = False,
     gradient_accumulation_steps: int = 1,
     seed: Optional[int] = None,
     mixed_precision: Optional[str] = "fp16",
     train_batch_size: int = 1,
-    lora: bool = False,
-    lora_rank: int = 4,
     learning_rate: float = 5e-6,
-    learning_rate_text_encoder: Optional[float] = None,
     scale_lr: bool = False,
     lr_scheduler: str = "constant",  # ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
     lr_warmup_steps: int = 0,
@@ -123,9 +110,10 @@ def train(
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
     gradient_checkpointing: bool = False,
+    prior_preservation: Optional[float] = None,
+    train_temporal_conv: bool = False,
     checkpointing_steps: int = 1000,
 ):
-    # TODO: inspect signature & save args
     args = get_function_args()
 
     time_string = get_time_string()
@@ -135,15 +123,6 @@ def train(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=mixed_precision,
     )
-
-    # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
-    # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
-    # TODO (patil-suraj): Remove this check when gradient accumulation with two models is enabled in accelerate.
-    if train_text_encoder and gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
-        raise ValueError(
-            "Gradient accumulation is not supported when training the text encoder in distributed training. "
-            "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
-        )
 
     if seed is not None:
         set_seed(seed)
@@ -172,12 +151,15 @@ def train(
         subfolder="vae",
     )
 
-    unet = UNetPseudo3DConditionModel.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="unet",
+    unet = UNetPseudo3DConditionModel.from_2d_model(
+        os.path.join(pretrained_model_name_or_path, "unet"),
     )
+    # unet = UNetPseudo3DConditionModel.from_pretrained(
+    #     pretrained_model_name_or_path, 
+    #     subfolder="unet",
+    # )
 
-    pipeline = StableDiffusionPipeline(
+    pipeline = SpatioTemporalStableDiffusionPipeline(
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
@@ -189,16 +171,17 @@ def train(
     )
     pipeline.set_progress_bar_config(disable=True)
 
-    unet2d = UNet2DConditionModel.from_pretrained(
-        pretrained_2d_model_name_or_path,
-        subfolder="unet",
-    )
+    if prior_preservation is not None:
+        unet2d = UNet2DConditionModel.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="unet",
+        )
 
     if is_xformers_available():
         try:
-            unet.enable_xformers_memory_efficient_attention()
-            unet2d.enable_xformers_memory_efficient_attention()
             pipeline.enable_xformers_memory_efficient_attention()
+            if prior_preservation is not None:
+                unet2d.enable_xformers_memory_efficient_attention()
         except Exception as e:
             logger.warning(
                 "Could not enable memory efficient attention. Make sure xformers is installed"
@@ -207,30 +190,20 @@ def train(
 
     vae.requires_grad_(False)
     unet.requires_grad_(False)
-    unet2d.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    if lora:
-        unet_lora_params, _ = inject_trainable_lora(unet, r=lora_rank)
-        if train_text_encoder:
-            text_encoder_lora_params, _ = inject_trainable_lora(
-                text_encoder,
-                target_replace_module=["CLIPAttention"],
-                r=lora_rank,
-            )
-    else:
-        if train_text_encoder:
-            text_encoder.requires_grad_(True)
+    if prior_preservation is not None:
+        unet2d.requires_grad_(False)
 
-        for name, module in unet.named_modules():
-            # if name.endswith(("attn_temporal", ".to_q", "conv_temporal")):
-            if name.endswith(("attn_temporal", ".to_q")):
-                for params in module.parameters():
-                    params.requires_grad = True
+    trainable_modules = ("attn_temporal", ".to_q")
+    if train_temporal_conv:
+        trainable_modules += "conv_temporal"
+    for name, module in unet.named_modules():
+        if name.endswith(trainable_modules):
+            for params in module.parameters():
+                params.requires_grad = True
 
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        if train_text_encoder:
-            text_encoder.gradient_checkpointing_enable()
 
     if scale_lr:
         learning_rate = (
@@ -250,26 +223,7 @@ def train(
     else:
         optimizer_class = torch.optim.AdamW
 
-    text_lr = learning_rate if learning_rate_text_encoder is None else learning_rate_text_encoder
-
-    if lora:
-        params_to_optimize = (
-            [
-                {"params": itertools.chain(*unet_lora_params), "lr": learning_rate},
-                {
-                    "params": itertools.chain(*text_encoder_lora_params),
-                    "lr": text_lr,
-                },
-            ]
-            if train_text_encoder
-            else itertools.chain(*unet_lora_params)
-        )
-    else:
-        params_to_optimize = (
-            itertools.chain(unet.parameters(), text_encoder.parameters())
-            if train_text_encoder
-            else unet.parameters()
-        )
+    params_to_optimize = unet.parameters()
     optimizer = optimizer_class(
         params_to_optimize,
         lr=learning_rate,
@@ -322,7 +276,7 @@ def train(
     train_samples = torch.cat(train_samples)
     train_samples = (train_samples.numpy() * 0.5 + 0.5).clip(0, 1)
     train_samples = rearrange(train_samples, "b c f h w -> b f h w c")
-    train_samples = StableDiffusionPipeline.numpy_to_pil(train_samples)
+    train_samples = SpatioTemporalStableDiffusionPipeline.numpy_to_pil(train_samples)
     train_samples = [make_grid(images, cols=2) for images in zip(*train_samples)]
     train_samples[0].save(
         train_sample_save_path,
@@ -340,18 +294,9 @@ def train(
         num_training_steps=train_steps * gradient_accumulation_steps,
     )
 
-    if train_text_encoder:
-        (
-            unet,
-            text_encoder,
-            optimizer,
-            train_dataloader,
-            lr_scheduler,
-        ) = accelerator.prepare(unet, text_encoder, optimizer, train_dataloader, lr_scheduler)
-    else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
-        )
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
+    )
     accelerator.register_for_checkpointing(lr_scheduler)
 
     weight_dtype = torch.float32
@@ -364,9 +309,9 @@ def train(
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     vae.to(accelerator.device, dtype=weight_dtype)
-    if not train_text_encoder:
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
-    unet2d.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if prior_preservation is not None:
+        unet2d.to(accelerator.device, dtype=weight_dtype)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -383,8 +328,7 @@ def train(
     print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     print(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
     print(f"  Total optimization steps = {train_steps}")
-    global_step = 0
-    epoch = 0
+    step = 0
 
     if sample_prompts:
         save_sample_images(
@@ -398,123 +342,104 @@ def train(
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(
-        range(global_step, train_steps),
+        range(step, train_steps),
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description("Steps")
 
-    while global_step < train_steps:
-        for step, batch in enumerate(train_dataloader):
-            vae.eval()
-            unet.train()
-            if train_text_encoder:
-                text_encoder.train()
+    def make_data_yielder(dataloader):
+        while True:
+            for batch in dataloader:
+                yield batch
+            accelerator.wait_for_everyone()
 
-            # with accelerator.accumulate(unet):
-            # Convert images to latent space
-            images = batch["images"].to(dtype=weight_dtype)
-            b = images.shape[0]
-            images = rearrange(images, "b c f h w -> (b f) c h w")
-            latents = vae.encode(images).latent_dist.sample()
-            latents = rearrange(latents, "(b f) c h w -> b c f h w", b=b)
-            latents = latents * 0.18215
+    train_data_yielder = make_data_yielder(train_dataloader)
 
-            # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
-            # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (bsz,),
-                device=latents.device,
-            )
-            timesteps = timesteps.long()
+    while step < train_steps:
+        batch = next(train_data_yielder)
 
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        vae.eval()
+        text_encoder.eval()
+        unet.train()
+        if prior_preservation is not None:
+            unet2d.eval()
 
-            # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch["prompt_ids"])[0]
+        # with accelerator.accumulate(unet):
+        # Convert images to latent space
+        images = batch["images"].to(dtype=weight_dtype)
+        b = images.shape[0]
+        images = rearrange(images, "b c f h w -> (b f) c h w")
+        latents = vae.encode(images).latent_dist.sample()
+        latents = rearrange(latents, "(b f) c h w -> b c f h w", b=b)
+        latents = latents * 0.18215
 
-            # Predict the noise residual
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-            # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-            # regularize_index = random.randint(0, noisy_latents.shape[2] - 1)
-            # model_pred_2d = unet2d(noisy_latents[:,:, regularize_index], timesteps, encoder_hidden_states).sample
-            # loss = loss + F.mse_loss(model_pred[:,:,regularize_index].float(), model_pred_2d.float(), reduction="mean")
-
-            accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                params_to_clip = (
-                    itertools.chain(unet.parameters(), text_encoder.parameters())
-                    if train_text_encoder
-                    else unet.parameters()
-                )
-                accelerator.clip_grad_norm_(params_to_clip, max_grad_norm)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-
-                unet.eval()
-                if train_text_encoder:
-                    text_encoder.eval()
-
-                if sample_prompts and global_step % validation_steps == 0:
-                    if accelerator.is_main_process:
-                        save_sample_images(
-                            accelerator=accelerator,
-                            prompts=sample_prompts,
-                            pipeline=pipeline,
-                            clip_length=clip_length,
-                            step=global_step,
-                            logdir=logdir,
-                        )
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
-
-            if global_step >= train_steps:
-                break
-
-        accelerator.wait_for_everyone()
-
-        epoch += 1
-
-    # Create the pipeline using using the trained modules and save it.
-    if accelerator.is_main_process:
-        pipeline = DiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet),
-            text_encoder=accelerator.unwrap_model(text_encoder),
+        # Sample noise that we'll add to the latents
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each image
+        timesteps = torch.randint(
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (bsz,),
+            device=latents.device,
         )
-        if lora:
-            save_lora_weight(pipeline.unet, logdir + "/lora_weight.pt")
-            if train_text_encoder:
-                save_lora_weight(
-                    pipeline.text_encoder,
-                    logdir + "/lora_weight.text_encoder.pt",
-                    target_replace_module=["CLIPAttention"],
-                )
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the text embedding for conditioning
+        encoder_hidden_states = text_encoder(batch["prompt_ids"])[0]
+
+        # Predict the noise residual
+        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        # Get the target for loss depending on the prediction type
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
-            pipeline.save_pretrained(logdir)
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+        if prior_preservation is not None:
+            model_pred_2d = unet2d(noisy_latents[:, :, 0], timesteps, encoder_hidden_states).sample
+            loss = (
+                loss
+                + F.mse_loss(model_pred[:, :, 0].float(), model_pred_2d.float(), reduction="mean")
+                * prior_preservation
+            )
+
+        accelerator.backward(loss)
+        if accelerator.sync_gradients:
+            accelerator.clip_grad_norm_(unet.parameters(), max_grad_norm)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+        # Checks if the accelerator has performed an optimization step behind the scenes
+        if accelerator.sync_gradients:
+            progress_bar.update(1)
+            step += 1
+
+            if sample_prompts and step % validation_steps == 0:
+                unet.eval()
+                if accelerator.is_main_process:
+                    save_sample_images(
+                        accelerator=accelerator,
+                        prompts=sample_prompts,
+                        pipeline=pipeline,
+                        clip_length=clip_length,
+                        step=step,
+                        logdir=logdir,
+                    )
+
+        logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+        progress_bar.set_postfix(**logs)
+        accelerator.log(logs, step=step)
 
     accelerator.end_training()
     print("TRAINING DONE!")
@@ -541,24 +466,24 @@ if __name__ == "__main__":
     # )
 
     args = dict(
-        pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5-3d",
-        pretrained_2d_model_name_or_path="/data/ckpt/stable-diffusion-v1-5",
+        # pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5-3d",
+        pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5",
         logdir="/data/tune-a-video/ckpt/debug",
-        train_data_path="/data/data/video/sample/surfing/01",
+        train_data_path="/data/data/video/sample/surfing/02",
         prompt="a man is surfing a wave",
         validation_steps=100,
         checkpointing_steps=50000,
         clip_length=8,
         sample_prompts=[
             "a man is surfing a wave",
-            "a girl is surfing a wave",
+            "a lady  in a yellow dress is surfing a wave",
             "a sloth is surfing a wave",
-            "a sloth",
-            # "a cat is posing",
-            # "a cat",
+            "a man is surfing in a desert",
         ],
         seed=0,
         learning_rate=3e-5,
         train_steps=1000,
+        prior_preservation=None,
+        train_temporal_conv=False,
     )
     train(**args)
