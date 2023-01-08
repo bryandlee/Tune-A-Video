@@ -1,3 +1,4 @@
+# code mostly taken from https://github.com/huggingface/diffusers
 from functools import partial
 
 import torch
