@@ -74,26 +74,34 @@ class SampleLogger:
         guidance_scale: float = 7,
         annotate: bool = True,
         annotate_size: int = 15,
+        make_grid: bool = True,
+        grid_column_size: int = 2,
     ) -> None:
         self.prompts = prompts
         self.clip_length = clip_length
         self.guidance_scale = guidance_scale
         self.num_inference_steps = num_inference_steps
         self.num_samples_per_prompt = num_samples_per_prompt
+        max_num_samples_per_prompt = int(1e5)
+        if self.num_samples_per_prompt > max_num_samples_per_prompt:
+            raise ValueError
+        seeds = torch.randint(0, max_num_samples_per_prompt, (self.num_samples_per_prompt,))
+        self.seeds = seeds.numpy().tolist()
 
         self.logdir = os.path.join(logdir, subdir)
         os.makedirs(self.logdir)
 
         self.annotate = annotate
         self.annotate_size = annotate_size
+        self.make_grid = make_grid
+        self.grid_column_size = grid_column_size
 
     def log_sample_images(
         self, pipeline: SpatioTemporalStableDiffusionPipeline, device: torch.device, step: int
     ):
-        save_path = os.path.join(self.logdir, f"step_{step}.gif")
-        image_sequences = []
-        for prompt in tqdm(self.prompts, desc="Generating sample images"):
-            for seed in range(self.num_samples_per_prompt):
+        samples_all = []
+        for idx, prompt in enumerate(tqdm(self.prompts, desc="Generating sample images")):
+            for seed in self.seeds:
                 generator = torch.Generator(device=device)
                 generator.manual_seed(seed)
                 sequence = pipeline(
@@ -109,10 +117,17 @@ class SampleLogger:
                     images = [
                         annotate_image(image, prompt, font_size=self.annotate_size) for image in sequence
                     ]
-                image_sequences.append(images)
 
-        image_sequences = [make_grid(images, cols=2) for images in zip(*image_sequences)]
-        save_images_as_gif(image_sequences, save_path)
+                if self.make_grid:
+                    samples_all.append(images)
+                else:
+                    save_path = os.path.join(self.logdir, f"step_{step}_{idx}_{seed}.gif")
+                    save_images_as_gif(images, save_path)
+
+        if self.make_grid:
+            samples_all = [make_grid(images, cols=2) for images in zip(*samples_all)]
+            save_path = os.path.join(self.logdir, f"step_{step}.gif")
+            save_images_as_gif(samples_all, save_path)
 
 
 def train(
