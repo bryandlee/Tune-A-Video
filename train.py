@@ -1,6 +1,9 @@
 import os
-from typing import Optional, List, Optional
-import json
+import inspect
+from typing import Optional, List, Dict
+
+import click
+from omegaconf import OmegaConf
 
 import torch
 import torch.utils.data
@@ -13,7 +16,7 @@ from accelerate.utils import set_seed
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    EulerDiscreteScheduler,
+    DDIMScheduler,
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
@@ -25,13 +28,11 @@ from einops import rearrange
 from video_diffusion.models.unet_3d_condition import UNetPseudo3DConditionModel
 from video_diffusion.data.dataset import ImageSequenceDataset
 from video_diffusion.common.util import get_time_string, get_function_args
-from video_diffusion.common.image_util import make_grid, annotate_text
+from video_diffusion.common.image_util import make_grid, annotate_image, save_images_as_gif
 from video_diffusion.pipelines.stable_diffusion import SpatioTemporalStableDiffusionPipeline
 
 
 logger = get_logger(__name__)
-
-gif_duration = 200
 
 
 def collate_fn(examples):
@@ -42,64 +43,90 @@ def collate_fn(examples):
     return batch
 
 
-def save_sample_images(
-    accelerator,
-    prompts,
-    pipeline,
-    step,
-    logdir,
-    clip_length,
+def log_train_samples(
+    train_dataloader,
+    save_path,
+    num_batch: int = 4,
 ):
-    image_save_root = os.path.join(logdir, "sample")
-    os.makedirs(image_save_root, exist_ok=True)
-    image_save_path = os.path.join(image_save_root, f"step_{str(step).zfill(6)}.gif")
+    train_samples = []
+    for idx, batch in enumerate(train_dataloader):
+        if idx >= num_batch:
+            break
+        train_samples.append(batch["images"])
 
-    sequences = []
-    for idx, prompt in enumerate(
-        tqdm(
-            prompts,
-            desc="Generating sample images",
-            disable=not accelerator.is_local_main_process,
-        )
+    train_samples = torch.cat(train_samples).numpy()
+    train_samples = rearrange(train_samples, "b c f h w -> b f h w c")
+    train_samples = (train_samples * 0.5 + 0.5).clip(0, 1)
+    train_samples = SpatioTemporalStableDiffusionPipeline.numpy_to_pil(train_samples)
+    train_samples = [make_grid(images, cols=2) for images in zip(*train_samples)]
+    save_images_as_gif(train_samples, save_path)
+
+
+class SampleLogger:
+    def __init__(
+        self,
+        prompts: List[str],
+        clip_length: int,
+        logdir: str,
+        subdir: str = "sample",
+        num_samples_per_prompt: int = 2,
+        num_inference_steps: int = 20,
+        guidance_scale: float = 7,
+        annotate: bool = True,
+        annotate_size: int = 15,
+    ) -> None:
+        self.prompts = prompts
+        self.clip_length = clip_length
+        self.guidance_scale = guidance_scale
+        self.num_inference_steps = num_inference_steps
+        self.num_samples_per_prompt = num_samples_per_prompt
+
+        self.logdir = os.path.join(logdir, subdir)
+        os.makedirs(self.logdir)
+
+        self.annotate = annotate
+        self.annotate_size = annotate_size
+
+    def log_sample_images(
+        self, pipeline: SpatioTemporalStableDiffusionPipeline, device: torch.device, step: int
     ):
-        generator = torch.Generator(device=accelerator.device)
-        generator.manual_seed(idx)
-        sequence = pipeline(
-            prompt,
-            num_inference_steps=20,
-            generator=generator,
-            clip_length=clip_length,
-            guidance_scale=7,
-        ).images[0]
+        save_path = os.path.join(self.logdir, f"step_{step}.gif")
+        image_sequences = []
+        for prompt in tqdm(self.prompts, desc="Generating sample images"):
+            for seed in range(self.num_samples_per_prompt):
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+                sequence = pipeline(
+                    prompt,
+                    generator=generator,
+                    num_inference_steps=self.num_inference_steps,
+                    clip_length=self.clip_length,
+                    guidance_scale=self.guidance_scale,
+                    num_images_per_prompt=1,
+                ).images[0]
 
-        sequence = [annotate_text(image, prompt, font_size=15) for image in sequence]
-        sequences.append(sequence)
+                if self.annotate:
+                    images = [
+                        annotate_image(image, prompt, font_size=self.annotate_size) for image in sequence
+                    ]
+                image_sequences.append(images)
 
-    sequences = [make_grid(images, cols=2) for images in zip(*sequences)]
-    sequences[0].save(
-        image_save_path,
-        save_all=True,
-        append_images=sequences[1:],
-        optimize=False,
-        loop=0,
-        duration=gif_duration,
-    )
+        image_sequences = [make_grid(images, cols=2) for images in zip(*image_sequences)]
+        save_images_as_gif(image_sequences, save_path)
 
 
 def train(
-    pretrained_model_name_or_path: str,
+    pretrained_model_path: str,
     logdir: str,
-    train_data_path: str,
-    prompt: str,
+    train_dataset: Dict,
+    train_steps: int = 300,
     validation_steps: int = 1000,
-    clip_length=8,
-    sample_prompts: List[str] = None,
-    train_steps: int = int(1e5),
+    validation_sample_logger: Optional[Dict] = None,
     gradient_accumulation_steps: int = 1,
     seed: Optional[int] = None,
     mixed_precision: Optional[str] = "fp16",
     train_batch_size: int = 1,
-    learning_rate: float = 5e-6,
+    learning_rate: float = 3e-5,
     scale_lr: bool = False,
     lr_scheduler: str = "constant",  # ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
     lr_warmup_steps: int = 0,
@@ -123,49 +150,42 @@ def train(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=mixed_precision,
     )
+    if accelerator.is_main_process:
+        os.makedirs(logdir, exist_ok=True)
+        OmegaConf.save(args, os.path.join(logdir, "config.yml"))
 
     if seed is not None:
         set_seed(seed)
 
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        os.makedirs(logdir, exist_ok=True)
-        with open(os.path.join(logdir, "config.json"), "w") as f:
-            json.dump(args, f, indent=2)
-
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path,
+        pretrained_model_path,
         subfolder="tokenizer",
         use_fast=False,
     )
 
     # Load models and create wrapper for stable diffusion
     text_encoder = CLIPTextModel.from_pretrained(
-        pretrained_model_name_or_path,
+        pretrained_model_path,
         subfolder="text_encoder",
     )
 
     vae = AutoencoderKL.from_pretrained(
-        pretrained_model_name_or_path,
+        pretrained_model_path,
         subfolder="vae",
     )
 
     unet = UNetPseudo3DConditionModel.from_2d_model(
-        os.path.join(pretrained_model_name_or_path, "unet"),
+        os.path.join(pretrained_model_path, "unet"),
     )
-    # unet = UNetPseudo3DConditionModel.from_pretrained(
-    #     pretrained_model_name_or_path, 
-    #     subfolder="unet",
-    # )
 
     pipeline = SpatioTemporalStableDiffusionPipeline(
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         unet=unet,
-        scheduler=EulerDiscreteScheduler.from_pretrained(
-            pretrained_model_name_or_path,
+        scheduler=DDIMScheduler.from_pretrained(
+            pretrained_model_path,
             subfolder="scheduler",
         ),
     )
@@ -173,7 +193,7 @@ def train(
 
     if prior_preservation is not None:
         unet2d = UNet2DConditionModel.from_pretrained(
-            pretrained_model_name_or_path,
+            pretrained_model_path,
             subfolder="unet",
         )
 
@@ -233,31 +253,19 @@ def train(
     )
 
     noise_scheduler = DDPMScheduler.from_pretrained(
-        pretrained_model_name_or_path,
+        pretrained_model_path,
         subfolder="scheduler",
     )
 
-    # train_datasets = [
-    #     ImageSequenceDataset(
-    #         path=os.path.join(train_data_path, clip_name),
-    #         n_sample_frame=clip_length,
-    #         sampling_rate=10,
-    #         stride=1,
-    #         tokenizer=tokenizer,
-    #         prompt=prompt,
-    #     )
-    #     for clip_name in os.listdir(train_data_path)
-    # ]
-    # train_dataset = torch.utils.data.ConcatDataset(train_datasets)
+    prompt_ids = tokenizer(
+        train_dataset["prompt"],
+        truncation=True,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    ).input_ids
 
-    train_dataset = ImageSequenceDataset(
-        path=train_data_path,
-        n_sample_frame=clip_length,
-        sampling_rate=10,
-        stride=1,
-        tokenizer=tokenizer,
-        prompt=prompt,
-    )
+    train_dataset = ImageSequenceDataset(**train_dataset, prompt_ids=prompt_ids)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -268,24 +276,7 @@ def train(
     )
 
     train_sample_save_path = os.path.join(logdir, "train_samples.gif")
-    train_samples = []
-    for idx, batch in enumerate(train_dataloader):
-        if idx >= 4:
-            break
-        train_samples.append(batch["images"])
-    train_samples = torch.cat(train_samples)
-    train_samples = (train_samples.numpy() * 0.5 + 0.5).clip(0, 1)
-    train_samples = rearrange(train_samples, "b c f h w -> b f h w c")
-    train_samples = SpatioTemporalStableDiffusionPipeline.numpy_to_pil(train_samples)
-    train_samples = [make_grid(images, cols=2) for images in zip(*train_samples)]
-    train_samples[0].save(
-        train_sample_save_path,
-        save_all=True,
-        append_images=train_samples[1:],
-        optimize=False,
-        loop=0,
-        duration=gif_duration,
-    )
+    log_train_samples(save_path=train_sample_save_path, train_dataloader=train_dataloader)
 
     lr_scheduler = get_scheduler(
         lr_scheduler,
@@ -321,23 +312,23 @@ def train(
     # Train!
     total_batch_size = train_batch_size * accelerator.num_processes * gradient_accumulation_steps
 
-    print("***** Running training *****")
-    print(f"  Num examples = {len(train_dataset)}")
-    print(f"  Num batches each epoch = {len(train_dataloader)}")
-    print(f"  Instantaneous batch size per device = {train_batch_size}")
-    print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    print(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
-    print(f"  Total optimization steps = {train_steps}")
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Instantaneous batch size per device = {train_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
+    logger.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {train_steps}")
     step = 0
 
-    if sample_prompts:
-        save_sample_images(
-            accelerator=accelerator,
+    if validation_sample_logger is not None and accelerator.is_main_process:
+        validation_sample_logger = SampleLogger(**validation_sample_logger, logdir=logdir)
+        validation_sample_logger.log_sample_images(
             pipeline=pipeline,
-            prompts=sample_prompts,
-            clip_length=clip_length,
+            device=accelerator.device,
             step=0,
-            logdir=logdir,
         )
 
     # Only show the progress bar once on each machine.
@@ -378,10 +369,7 @@ def train(
         bsz = latents.shape[0]
         # Sample a random timestep for each image
         timesteps = torch.randint(
-            0,
-            noise_scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=latents.device,
+            0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
         )
         timesteps = timesteps.long()
 
@@ -425,65 +413,40 @@ def train(
             progress_bar.update(1)
             step += 1
 
-            if sample_prompts and step % validation_steps == 0:
-                unet.eval()
-                if accelerator.is_main_process:
-                    save_sample_images(
-                        accelerator=accelerator,
-                        prompts=sample_prompts,
+            if accelerator.is_main_process:
+
+                if validation_sample_logger is not None and step % validation_steps == 0:
+                    unet.eval()
+                    validation_sample_logger.log_sample_images(
                         pipeline=pipeline,
-                        clip_length=clip_length,
+                        device=accelerator.device,
                         step=step,
-                        logdir=logdir,
                     )
+
+                if step % checkpointing_steps == 0:
+                    accepts_keep_fp32_wrapper = "keep_fp32_wrapper" in set(
+                        inspect.signature(accelerator.unwrap_model).parameters.keys()
+                    )
+                    extra_args = {"keep_fp32_wrapper": True} if accepts_keep_fp32_wrapper else {}
+                    pipeline_save = SpatioTemporalStableDiffusionPipeline.from_pretrained(
+                        pretrained_model_path,
+                        unet=accelerator.unwrap_model(unet, **extra_args),
+                    )
+                    checkpoint_save_path = os.path.join(logdir, f"checkpoint_{step}")
+                    pipeline_save.save_pretrained(checkpoint_save_path)
 
         logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)
         accelerator.log(logs, step=step)
 
     accelerator.end_training()
-    print("TRAINING DONE!")
+
+
+@click.command()
+@click.option("--config", type=str, default="config/sample.yml")
+def run(config):
+    train(**OmegaConf.load(config))
 
 
 if __name__ == "__main__":
-    # args = dict(
-    #     pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5-3d",
-    #     pretrained_2d_model_name_or_path="/data/ckpt/stable-diffusion-v1-5",
-    #     logdir="/data/tune-a-video/ckpt/debug",
-    #     train_data_path="/data/data/video/sample/frames/02",
-    #     prompt="a model is posing",
-    #     validation_steps=100,
-    #     checkpointing_steps=50000,
-    #     clip_length=8,
-    #     sample_prompts=[
-    #         "a female model with long blonde hair is posing",
-    #         "a male model with short black hair is posing",
-    #         "a cat is posing",
-    #         "a cat",
-    #     ],
-    #     seed=0,
-    #     learning_rate=3e-5,
-    # )
-
-    args = dict(
-        # pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5-3d",
-        pretrained_model_name_or_path="/data/ckpt/stable-diffusion-v1-5",
-        logdir="/data/tune-a-video/ckpt/debug",
-        train_data_path="/data/data/video/sample/surfing/02",
-        prompt="a man is surfing a wave",
-        validation_steps=100,
-        checkpointing_steps=50000,
-        clip_length=8,
-        sample_prompts=[
-            "a man is surfing a wave",
-            "a lady  in a yellow dress is surfing a wave",
-            "a sloth is surfing a wave",
-            "a man is surfing in a desert",
-        ],
-        seed=0,
-        learning_rate=3e-5,
-        train_steps=1000,
-        prior_preservation=None,
-        train_temporal_conv=False,
-    )
-    train(**args)
+    run()
