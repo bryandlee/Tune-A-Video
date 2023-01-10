@@ -86,7 +86,7 @@ class SampleLogger:
         if self.num_samples_per_prompt > max_num_samples_per_prompt:
             raise ValueError
         seeds = torch.randint(0, max_num_samples_per_prompt, (self.num_samples_per_prompt,))
-        self.seeds = seeds.numpy().tolist()
+        self.seeds = sorted(seeds.numpy().tolist())
 
         self.logdir = os.path.join(logdir, subdir)
         os.makedirs(self.logdir)
