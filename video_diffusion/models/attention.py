@@ -153,7 +153,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
         only_cross_attention: bool = False,
         upcast_attention: bool = False,
         use_sparse_causal_attention: bool = True,
-        temporal_attention_position: str = "after_spatial",
+        temporal_attention_position: str = "after_feedforward",
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
