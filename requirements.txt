@@ -1,0 +1,9 @@
+torch==1.12.1+cu116
+torchvision==0.13.1+cu116
+diffusers[torch]==0.11.1
+accelerate==0.15.0
+transformers==4.25.1
+bitsandbytes==0.35.4
+ftfy
+tensorboard
+modelcards
