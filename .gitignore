@@ -142,10 +142,6 @@ runs
 /examples/**/*.args
 /examples/rag/sweep
 
-# data
-/data
-serialization_dir
-
 # emacs
 *.*~
 debug.env
