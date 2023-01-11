@@ -69,7 +69,8 @@ class SampleLogger:
         clip_length: int,
         logdir: str,
         subdir: str = "sample",
-        num_samples_per_prompt: int = 2,
+        num_samples_per_prompt: int = 1,
+        sample_seeds: List[int] = None,
         num_inference_steps: int = 20,
         guidance_scale: float = 7,
         annotate: bool = True,
@@ -81,12 +82,14 @@ class SampleLogger:
         self.clip_length = clip_length
         self.guidance_scale = guidance_scale
         self.num_inference_steps = num_inference_steps
-        self.num_samples_per_prompt = num_samples_per_prompt
-        max_num_samples_per_prompt = int(1e5)
-        if self.num_samples_per_prompt > max_num_samples_per_prompt:
-            raise ValueError
-        seeds = torch.randint(0, max_num_samples_per_prompt, (self.num_samples_per_prompt,))
-        self.seeds = sorted(seeds.numpy().tolist())
+
+        if sample_seeds is None:
+            max_num_samples_per_prompt = int(1e5)
+            if num_samples_per_prompt > max_num_samples_per_prompt:
+                raise ValueError
+            sample_seeds = torch.randint(0, max_num_samples_per_prompt, (num_samples_per_prompt,))
+            sample_seeds = sorted(sample_seeds.numpy().tolist())
+        self.sample_seeds = sample_seeds
 
         self.logdir = os.path.join(logdir, subdir)
         os.makedirs(self.logdir)
@@ -101,7 +104,7 @@ class SampleLogger:
     ):
         samples_all = []
         for idx, prompt in enumerate(tqdm(self.prompts, desc="Generating sample images")):
-            for seed in self.seeds:
+            for seed in self.sample_seeds:
                 generator = torch.Generator(device=device)
                 generator.manual_seed(seed)
                 sequence = pipeline(

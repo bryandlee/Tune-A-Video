@@ -14,13 +14,13 @@ validation_sample_logger:
         "a man is surfing a wave cartoon style",
     ]
     clip_length: "${..train_dataset.n_sample_frame}"
-    num_samples_per_prompt: 1
+    sample_seeds: [12734]
     num_inference_steps: 20
     guidance_scale: 7
-train_steps: 1000
+train_steps: 500
 validation_steps: 100
-checkpointing_steps: 1000
-seed: 0
+checkpointing_steps: 500
+seed: 74831
 learning_rate: 1e-5
-prior_preservation: 0.5
+prior_preservation: null
 train_temporal_conv: False
