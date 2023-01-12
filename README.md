@@ -2,6 +2,7 @@
 
 Unofficial implementation of [Tune-A-Video](https://arxiv.org/abs/2212.11565)
 
+![step_500_resized](https://user-images.githubusercontent.com/26464535/211755110-94ba1fbf-a55a-4f71-b665-b7ab2a26121c.gif)
 
 ### Training
 ```
